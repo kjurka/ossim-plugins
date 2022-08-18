@@ -13,13 +13,18 @@
 #include <openjpeg.h>
 
 #include <ossimOpjNitfReader.h>
+#include <ossimOpjCommon.h>
 #include <ossim/base/ossimCommon.h>
 #include <ossim/base/ossimException.h>
 #include <ossim/base/ossimTrace.h>
-#include <ossim/base/ossimEndian.h>
-#include <ossim/imaging/ossimTiffTileSource.h>
-#include <ossim/imaging/ossimImageDataFactory.h>
+//#include <ossim/base/ossimEndian.h>
+//#include <ossim/imaging/ossimTiffTileSource.h>
+//#include <ossim/imaging/ossimImageDataFactory.h>
 #include <ossim/support_data/ossimNitfImageHeader.h>
+#include <ossim/support_data/ossimJ2kCodRecord.h>
+#include <ossim/support_data/ossimJ2kSizRecord.h>
+#include <ossim/support_data/ossimJ2kSotRecord.h>
+#include <ossim/support_data/ossimJ2kTlmRecord.h>
 using namespace std;
 
 #ifdef OSSIM_ID_ENABLED
@@ -215,70 +220,152 @@ bool ossimOpjNitfReader::scanForJpegBlockOffsets()
    return true;
 }
 
+std::ostream& ossimOpjNitfReader::dumpTiles(std::ostream& out)
+{
+   //---
+   // NOTE:
+   // SOC = 0xff4f Start of Codestream
+   // SOT = 0xff90 Start of tile
+   // SOD = 0xff93 Last marker in each tile
+   // EOC = 0xffd9 End of Codestream
+   //---
+   
+   const ossimNitfImageHeader* hdr = getCurrentImageHeader();
+   if(hdr)
+   {
+      // Capture the starting position.
+      std::streampos currentPos = theFileStr->tellg();
+      
+      // Seek to the first block.
+      // theFileStr->seekg(m_startOfCodestreamOffset, ios_base::beg);
+      if (theFileStr->good())
+      {
+         out << "offset to codestream: " << currentPos << "\n";
+         
+         //---
+         // Read the first two bytes and test for SOC (Start Of Codestream)
+         // marker.
+         //---
+         ossim_uint8 markerField[2];
+         theFileStr->read( (char*)markerField, 2);
+
+         bool foundSot = false;
+         if ( (markerField[0] == 0xff) && (markerField[1] == 0x4f) )
+         {
+            // Get the SIZ marker and dump it.
+            theFileStr->read( (char*)markerField, 2);
+            if ( (markerField[0] == 0xff) && (markerField[1] == 0x51) )
+            {
+               ossimJ2kSizRecord siz;
+               siz.parseStream( *theFileStr );
+               siz.print(out);
+            }
+            
+            // Find the firt tile marker.
+            char c;
+            while ( theFileStr->get(c) )
+            {
+               if (static_cast<ossim_uint8>(c) == 0xff)
+               {
+                  if ( theFileStr->get(c) )
+                  {
+                     out << "marker: 0xff" << hex << (ossim_uint16)c << dec << endl;
+                     
+                     if (static_cast<ossim_uint8>(c) == 0x52)
+                     {
+                        out << "\nFound COD...\n\n" << endl;
+                        ossimJ2kCodRecord cod;
+                        cod.parseStream( *theFileStr );
+                        cod.print(out);
+
+                     }
+                     else if (static_cast<ossim_uint8>(c) == 0x55)
+                     {
+                        out << "\nFound TLM...\n\n" << endl;
+                        ossimJ2kTlmRecord tlm;
+                        tlm.parseStream( *theFileStr );
+                        tlm.print(out);
+                     }
+                     else if (static_cast<ossim_uint8>(c) == 0x90)
+                     {
+                        foundSot = true;
+                        break;
+                     }
+                  }
+               }
+            }
+         }
+
+         if (foundSot) // At SOT marker...
+         {
+            const ossim_uint32 BLOCKS =
+               hdr->getNumberOfBlocksPerRow() * hdr->getNumberOfBlocksPerCol();
+            for (ossim_uint32 i = 0; i < BLOCKS; ++i)
+            {
+               std::streamoff pos = theFileStr->tellg();
+               out << "sot pos: " << pos << endl;
+               ossimJ2kSotRecord sotRecord;
+               sotRecord.parseStream( *theFileStr );
+               pos += sotRecord.thePsot;
+               sotRecord.print(out);
+               theFileStr->seekg(pos, ios_base::beg);
+            }
+
+            // Find EOC marker
+            char c;
+            while ( theFileStr->get(c) )
+            {
+               if (static_cast<ossim_uint8>(c) == 0xff)
+               {
+                  if ( theFileStr->get(c) )
+                  {
+                     out << "marker: 0xff" << hex << (ossim_uint16)c << dec << endl;
+                     
+                     if (static_cast<ossim_uint8>(c) == 0xd9)
+                     {
+                        out << "EOC FOUND..." << endl;
+                        out << "eoc pos: " << (theFileStr->tellg()-2) << endl;
+		     }
+		  }
+	       }
+	    }
+         }
+      }
+
+      // If the last byte is read, the eofbit must be reset. 
+      if ( theFileStr->eof() )
+      {
+         theFileStr->clear();
+      }
+      
+      // Put the stream back to the where it was.
+      theFileStr->seekg(currentPos);
+   }
+
+   return out;
+}
+
 bool ossimOpjNitfReader::uncompressJpegBlock(ossim_uint32 x,
                                              ossim_uint32 y)
 {
-   ossim_uint32 blockNumber = getBlockNumber(ossimIpt(x,y));
-
-   if (traceDebug())
-   {
-      ossimNotify(ossimNotifyLevel_DEBUG)
-         << "ossimNitfTileSource::uncompressJpegBlock DEBUG:"
-         << "\nblockNumber:  " << blockNumber
-         << "\noffset to block: " << theNitfBlockOffset[blockNumber]
-         << "\nblock size: " << theNitfBlockSize[blockNumber]
-         << std::endl;
-   }
-   
-   // Seek to the block.
-   theFileStr->seekg(theNitfBlockOffset[blockNumber], ios::beg);
-
-   //---
-   // Get a buffer to read the compressed block into.  If all the blocks are
-   // the same size this will be theCompressedBuf; else we will make our own.
-   //---
-   ossim_uint8* compressedBuf = &theCompressedBuf.front();
-   if (!compressedBuf)
-   {
-      compressedBuf = new ossim_uint8[theNitfBlockSize[blockNumber]];
-   }
-
-
-   // Read the block into memory.  We could store this
-   if (!theFileStr->read((char*)compressedBuf, theNitfBlockSize[blockNumber]))
-   {
-      theFileStr->clear();
-      ossimNotify(ossimNotifyLevel_FATAL)
-         << "ossimNitfTileSource::loadBlock Read Error!"
-         << "\nReturning error..." << endl;
-      theErrorStatus = ossimErrorCodes::OSSIM_ERROR;
-      delete [] compressedBuf;
-      compressedBuf = 0;
-      return false;
-   }
-
-   try
-   {
-      //theCacheTile = decoder.decodeBuffer(compressedBuf,
-      //                                    theNitfBlockSize[blockNumber]);
-   }
-   catch (const ossimException& e)
-   {
-      ossimNotify(ossimNotifyLevel_FATAL)
-         << e.what() << std::endl;
-      theErrorStatus = ossimErrorCodes::OSSIM_ERROR;
-   }
-
-   // If theCompressedBuf is null that means we allocated the compressedBuf.
-   if (theCompressedBuf.size() == 0)
-   {
-      delete [] compressedBuf;
-      compressedBuf = 0;
-   }
-   
-   if (theErrorStatus == ossimErrorCodes::OSSIM_ERROR)
+   const ossimNitfImageHeader* hdr = getCurrentImageHeader();
+   if (!hdr)
    {
       return false;
    }
+
+   ossim_uint32 blockX = x / theCacheSize.x;
+   ossim_uint32 blockY = y / theCacheSize.y;
+
+   ossimIrect rect(ossimIpt(blockX * theCacheSize.x, blockY * theCacheSize.y),
+		   ossimIpt((blockX + 1) * theCacheSize.x - 1, (blockY + 1) * theCacheSize.y - 1));
+
+   std::streamoff offset = hdr->getDataLocation();
+   theFileStr->seekg(offset, ios::beg);
+   dumpTiles(ossimNotify(ossimNotifyLevel_WARN)); // KJJ
+   ossim_int32 format = ossim::getCodecFormat(theFileStr.get());
+   ossim::opj_decode(theFileStr.get(), rect, 0, format, offset, theCacheTile.get());
+
    return true;
 }
+

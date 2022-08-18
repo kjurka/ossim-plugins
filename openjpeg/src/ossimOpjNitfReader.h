@@ -62,6 +62,7 @@ protected:
    virtual bool uncompressJpegBlock(ossim_uint32 x, ossim_uint32 y);
 
 private:
+   std::ostream& dumpTiles(std::ostream& out);
 
 TYPE_DATA   
 };
